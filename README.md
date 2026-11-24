@@ -1,6 +1,6 @@
-# SKILLS
+# Skills for learning
 
-A personal collection of agentic skills — instructions and reference files that extend AI coding agents (e.g. Claude Code) with custom workflows and domain knowledge.
+A personal collection of agentic skills that support the learning process: reading technical sources accurately, citing them honestly, and writing clear, precise explanations. Each skill is a set of instructions and reference files that extends AI coding agents (e.g. Claude Code) with a custom workflow.
 
 Created for my own use; not intended as a general-purpose library.
 
