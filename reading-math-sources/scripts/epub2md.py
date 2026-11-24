@@ -191,6 +191,12 @@ def convert(z, path, outdir, idx, title):
         else:
             im.replace_with(image_marker(im, disp))
 
+    # pandoc has no plain-text subscript: it would write ∫ _(A) and f ₁. Keep the structure explicit instead.
+    for t in body.find_all(["sub", "sup"]):
+        t.insert_before(NavigableString(f"ZQX{t.name.upper()}OZQX"))
+        t.insert_after(NavigableString(f"ZQX{t.name.upper()}CZQX"))
+        t.unwrap()
+
     md = pypandoc.convert_text(
         str(body), "gfm-tex_math_gfm+tex_math_dollars-raw_html", format="html", extra_args=["--wrap=none", "--quiet"]
     )
@@ -205,7 +211,13 @@ def convert(z, path, outdir, idx, title):
     md = "\n".join(
         l if l.lstrip().startswith("|") else re.sub(r"\\([<>\[\]|~^])", r"\1", l) for l in md.split("\n")
     )
+    # Springer sets theorem text as <i>Let</i><math/><i>be ...</i> with no spaces: restore them around the maths
+    md = re.sub(r"(?<=[^\s*])(\*+)(ZQXSLOT\d+ZQX)", r"\1 \2", md)
+    md = re.sub(r"(ZQXSLOT\d+ZQX)(\*+)(?=\w)", r"\1 \2", md)
     md = re.sub(r"ZQXSLOT(\d+)ZQX", fill, md)
+    md = re.sub(r"ZQX(SUB|SUP)([OC])ZQX", lambda mo: ("<" if mo.group(2) == "O" else "</") + mo.group(1).lower() + ">", md)
+    md = md.replace("\u00a0", " ").replace("\u200b", "")  # so that grep 'Theorem 4.2.2' matches
+    md = re.sub(r"^\\\((\w[\w.]*)\\\)$", r"(\1)", md, flags=re.M)  # equation number on its own line: \(1\) -> (1)
     md = re.sub(r"\n{3,}", "\n\n", md)
     name = re.sub(r"[^A-Za-z0-9]+", "-", title or posixpath.basename(path))[:50].strip("-")
     out = outdir / f"{idx:03d}-{name}.md"
@@ -233,6 +245,7 @@ def main():
 
     if a.find:
         rx = re.compile(a.find, re.I)
+        boxed = False
         for i, (p, _) in enumerate(sp, 1):
             raw = z.read(p).decode("utf-8", "replace")
             txt = html.unescape(re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", re.sub(r"<img\b[^>]*>", " ▢ ", raw))))
@@ -241,6 +254,9 @@ def main():
                 print(f"[{i}] {posixpath.basename(p)}  {len(hits)} hit(s)")
                 for h in hits[:3]:
                     print("     …" + txt[max(0, h.start() - 70): h.end() + 110] + "…")
+                boxed = boxed or "▢" in txt
+        if boxed:
+            print("▢ = a formula or picture stored as an image element (its TeX, if any, appears after --doc N).")
         return
 
     if a.doc or a.all:

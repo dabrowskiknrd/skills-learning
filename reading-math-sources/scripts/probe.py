@@ -6,8 +6,9 @@
 
   uv run probe.py FILE.pdf                 facts + ROUTE (best source first)
   uv run probe.py FILE.pdf --find REGEX [--pages A-B]
-                                           PDF pages whose text layer matches (locating only);
-                                           case-insensitive, whitespace collapsed, matched page by page
+                                           PDF pages whose text layer matches (locating only), one line
+                                           per page; case-insensitive, whitespace collapsed, fi/fl
+                                           ligatures and line-break hyphens undone, so type plain words
   uv run probe.py FILE.pdf --toc           full outline with PDF page numbers
   uv run probe.py FILE.pdf --zoom N --part top|middle|bottom   300-dpi PNG of part of page N
 
@@ -48,6 +49,23 @@ def epub_summary(epub):
     kind = "IMAGES ONLY" if tex + mml == 0 else "MACHINE-READABLE"
     what = "publisher's LaTeX" if tex >= mml else "publisher's MathML, converted to LaTeX by pandoc"
     return kind, f"{tex} publisher-TeX, {mml} MathML, {img} image-only", what
+
+
+# pdfTeX and InDesign store "fi", "fl", "ffi" as single ligature glyphs: "Definition" is "De\ufb01nition" in the text layer
+LIGATURES = str.maketrans({"\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl", "\ufb03": "ffi", "\ufb04": "ffl", "\ufb05": "st", "\ufb06": "st"})
+DAMAGED = ("FILE IS DAMAGED: {why}\n"
+           "ROUTE\n 1. Tell the user to get a fresh copy of this file. Do not dig through the bytes;\n"
+           "    until then no formula or page number can be taken from it.")
+
+
+def searchable(text):
+    """Page text as --find matches it: (as typeset, with words broken over a line end rejoined)."""
+    t = text.translate(LIGATURES)
+    # no ToUnicode map (Distiller-era PDFs): the fi and fl ligatures come out as the symbols at their byte codes
+    t = re.sub(r"\u00ae(?=[a-z])", "fi", t)
+    t = re.sub(r"\u00af(?=[a-z])", "fl", t)
+    flat = re.sub(r"\s+", " ", t)
+    return flat, re.sub(r"(\w)- (\w)", r"\1\2", flat)
 
 
 HEAD_NUM = [re.compile(r"^(\d{1,4})$"), re.compile(r"^(\d{1,4})\s+\D"), re.compile(r"\D\s+(\d{1,4})$")]
@@ -145,8 +163,11 @@ def main():
 
     pymupdf.TOOLS.mupdf_display_errors(False)
     pymupdf.TOOLS.mupdf_display_warnings(False)
-    doc = pymupdf.open(f)
-    n = len(doc)
+    try:
+        doc = pymupdf.open(f)
+        n = len(doc)
+    except Exception:
+        sys.exit(f"{f.name}\n" + DAMAGED.format(why="it does not open as a PDF (truncated or corrupt download)."))
     texts = []
     for i in range(n):
         try:
@@ -154,6 +175,8 @@ def main():
         except Exception:
             texts.append("")
     damaged = "error" in (pymupdf.TOOLS.mupdf_warnings() or "").lower()
+    if n == 0 or (damaged and not any(t.strip() for t in texts)):
+        sys.exit(f"{f.name}\n" + DAMAGED.format(why="structural errors, and no page of it can be read."))
     pr = Printed(doc, texts)
 
     def printed(i):
@@ -168,16 +191,27 @@ def main():
         rx = re.compile(a.find, re.I)
         hits = 0
         only = page_set(a.pages) if a.pages else None
+        pages = 0
         for i, t in enumerate(texts, 1):
             if only is not None and i not in only:
                 continue
-            flat = re.sub(r"\s+", " ", t)
-            for m in rx.finditer(flat):
-                hits += 1
-                if hits <= 25:
-                    print(f"PDF p{i}{printed(i)}: …{flat[max(0, m.start() - 60): m.end() + 100]}…")
-        more = " (first 25 shown; narrow with --pages A-B)" if hits > 25 else ""
-        print(f"{hits} hit(s){more}. Text layer = locating only: it never tells you what a formula says.\n"
+            flat, joined = searchable(t)
+            found = list(rx.finditer(flat))
+            if not found:  # a word broken over a line end ("dur- ing"); real hyphens were tried first
+                flat = joined
+                found = list(rx.finditer(flat))
+            if not found:
+                continue
+            hits += len(found)
+            pages += 1
+            if pages <= 25:
+                m = found[0]
+                extra = f"  (+{len(found) - 1} more on this page)" if len(found) > 1 else ""
+                print(f"PDF p{i}{printed(i)}: …{flat[max(0, m.start() - 60): m.end() + 100]}…{extra}")
+        more = " (first 25 pages shown; narrow with --pages A-B)" if pages > 25 else ""
+        if not hits and not any(t.strip() for t in texts):
+            more = " - this PDF has no text layer, so nothing can match; use --toc or view pages"
+        print(f"{hits} hit(s) on {pages} page(s){more}. Text layer = locating only: it never tells you what a formula says.\n"
               "Printed numbers are a hint; cite the one you see on the page when you view it.")
         return
 
@@ -193,7 +227,12 @@ def main():
         out = Path(os.environ.get("READING_MATH_CACHE", Path.home() / ".cache" / "reading-math-sources")) / "zoom"
         out.mkdir(parents=True, exist_ok=True)
         png = out / f"{re.sub(r'[^A-Za-z0-9]+', '-', f.stem)[:40]}-p{a.zoom}-{a.part}.png"
-        page.get_pixmap(dpi=300 if a.part != "full" else 200, clip=clip).save(png)
+        pix = page.get_pixmap(dpi=300 if a.part != "full" else 200, clip=clip)
+        pix.save(png)
+        if pix.is_unicolor:
+            print(f"BLANK: PDF p{a.zoom} ({a.part}) renders as an empty area - nothing to read there"
+                  + (". This file is damaged: the page is lost." if damaged else " (try --part full, or the page is blank)."))
+            return
         print(f"{png}\nRead that file to view PDF p{a.zoom}{printed(a.zoom)} ({a.part}).")
         return
 
@@ -209,10 +248,13 @@ def main():
     print(f"{f.name}\nPages: {n}   Producer: {(meta.get('producer') or '?')[:40]}   Creator: {(meta.get('creator') or '?')[:40]}")
     mid = [i for i in (n // 4, n // 2, 3 * n // 4) if i >= 1 and pr.of(i)]
     eg = "; e.g. " + ", ".join(f"PDF p{i} = printed {pr.of(i)}" for i in mid) if mid else ""
-    print(f"Printed page numbers: {pr.how}{eg}. The offset can drift between chapters: use --find or --toc for a\n"
-          "  specific page, and cite the number visible on the page when you view it.")
-
     empty = [i for i, t in enumerate(texts, 1) if len(t.strip()) < 40]
+    no_text = len(empty) > 0.8 * n
+    if no_text:
+        print("Printed page numbers: not detected (no text layer): read the number off each page you view.")
+    else:
+        print(f"Printed page numbers: {pr.how}{eg}. The offset can drift between chapters: use --find or --toc for a\n"
+              "  specific page, and cite the number visible on the page when you view it.")
     scanned = 0
     sample = list(range(0, n, max(1, n // 25)))
     for i in sample:
@@ -223,7 +265,7 @@ def main():
         except Exception:
             big = False
         scanned += bool(big)
-    if len(empty) > 0.8 * n:
+    if no_text:
         print("Text layer: NONE (scanned) - nothing to grep; view pages, use the outline to navigate")
     elif scanned > 0.5 * len(sample):
         print("Text layer: OCR over page scans - good enough to locate, wrong for symbols")
@@ -231,10 +273,6 @@ def main():
         print("Text layer: present - good for locating; formulas in it are unreliable")
     if empty and len(empty) <= 0.8 * n:
         print(f"  PDF pages with no text (--find cannot see them): p{ranges(empty)}")
-    if damaged:
-        print("  FILE IS DAMAGED: the PDF has structural errors, so pages without text are probably unreadable,\n"
-              "  not scanned, and other tools (pdftotext, pdftoppm) may number its pages differently.\n"
-              "  Tell the user to get a fresh copy; meanwhile use another source for those pages.")
 
     if toc:
         top = [t for t in toc if t[0] == 1]
@@ -243,13 +281,29 @@ def main():
         for lvl, title, page in show:
             print(f"  {'  ' * (lvl - 1)}{title[:70]}  -> PDF p{page}{printed(page)}")
     else:
-        print("Outline: none (use --find on a heading)")
+        print("Outline: none (" + ("view the contents page to navigate" if no_text else "use --find on a heading") + ")")
 
     print("ROUTE (best source first)")
     k = 1
-    m = ARXIV.search(" ".join(texts[:2]))
+    if damaged:
+        lost = f"p{ranges(empty)}" if empty else "some pages"
+        print(f" {k}. FILE IS DAMAGED: structural errors; {lost} cannot be read (unreadable, not scanned), and other tools\n"
+              "    (pdftotext, pdftoppm) may number the pages differently. Tell the user to get a fresh copy and which\n"
+              "    pages are lost; the routes below serve the remaining pages only. For those, Read(pages=N) can be\n"
+              "    shifted by the lost pages: view page N with --zoom N --part full, and check the printed number on it.\n"
+              "    A page that still renders may be cut short: do not quote a statement whose end you cannot see.")
+        k += 1
+    front = " ".join(texts[:2])
+    stamps = list(ARXIV.finditer(front))  # a footer may repeat the id without its version
+    m = next((x for x in stamps if re.search(r"v\d+$", x.group(1))), stamps[0] if stamps else None)
     if m:
-        print(f' {k}. arXiv:{m.group(1)} is stamped on this PDF -> author\'s TeX:  uv run "{HERE / "arxiv_src.py"}" {m.group(1)}')
+        bare = "" if re.search(r"v\d+$", m.group(1)) else (" (no version on the stamp: this fetches the latest one, which may be newer than the PDF;\n"
+                                                             "    say so, and view the PDF page for any formula whose exact form matters)")
+        date = re.match(r"\s*\[[\w.\-]+\]\s*(\d{1,2}\s+[A-Z][a-z]{2}\s+\d{4})", front[m.end():])
+        when = f" ({date.group(1)})" if date else ""
+        print(f" {k}. arXiv:{m.group(1)}{when} is stamped on this PDF: the file is that preprint, whatever year its name carries,\n"
+              f"    so its equation and page numbers are that arXiv version's, not a journal printing's\n"
+              f'    -> author\'s TeX:  uv run "{HERE / "arxiv_src.py"}" {m.group(1)}{bare}')
         k += 1
     twin = f.with_suffix(".epub")
     if twin.is_file():
